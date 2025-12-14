@@ -1,101 +1,106 @@
 import socket
-from evdev import UInput, ecodes as e
+from evdev import UInput, ecodes as e, AbsInfo # 👈 AbsInfo 추가됨!
 
 # =================================================================
-# 1. UDP 통신 설정
+# 1. 설정
 # =================================================================
-# 🚨 라즈베리파이 IP 주소는 '0.0.0.0' (모든 IP에서 수신) 유지
-UDP_PORT = 4200      # ESP32 코드와 동일해야 합니다!
-
+UDP_PORT = 4200 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# 포트 바인딩
 try:
     sock.bind(('0.0.0.0', UDP_PORT))
-    print(f"✅ UDP 서버 시작. 포트: {UDP_PORT}")
-except OSError as e_msg:
-    print(f"❌ 오류: 포트 {UDP_PORT}를 사용할 수 없습니다. 다른 프로세스가 사용 중일 수 있습니다.")
+    print(f"✅ 라즈베리파이 UDP 서버 시작! 포트: {UDP_PORT}")
+except OSError as err:
+    print(f"❌ 포트 에러: {err}")
     exit()
 
 # =================================================================
-# 2. 가상 게임패드 정의
+# 2. 가상 게임패드 설정 (이 부분이 수정됨)
 # =================================================================
+
+# 버튼 매핑 (ESP32 순서: SW, 위, 왼, 아래, 오)
+BUTTON_MAP = [
+    e.BTN_TL,         # SW
+    e.BTN_DPAD_UP,    # 위
+    e.BTN_DPAD_LEFT,  # 왼
+    e.BTN_DPAD_DOWN,  # 아래
+    e.BTN_DPAD_RIGHT  # 오
+]
+
+# 🚨 수정된 부분: AbsInfo를 사용하여 명확하게 정의
+# 형식: AbsInfo(value=0, min=최소, max=최대, fuzz=0, flat=0, resolution=0)
 capabilities = {
     e.EV_ABS: [
-        (e.ABS_X, (-32768, 32767, 0, 0)),   # 왼쪽 X축 (조이스틱 VRX)
-        (e.ABS_Y, (-32768, 32767, 0, 0)),   # 왼쪽 Y축 (조이스틱 VRY)
-        (e.ABS_RX, (-32768, 32767, 0, 0)),  # 오른쪽 X축 (MPU Roll)
-        (e.ABS_RY, (-32768, 32767, 0, 0)),  # 오른쪽 Y축 (MPU Pitch)
+        (e.ABS_X,  AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
+        (e.ABS_Y,  AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
+        (e.ABS_RX, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
+        (e.ABS_RY, AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)),
     ],
-    e.EV_KEY: [
-        e.BTN_A, e.BTN_B, e.BTN_X, e.BTN_Y, # 버튼 4개
-        e.BTN_TL                            # SW 버튼
-    ]
+    e.EV_KEY: BUTTON_MAP
 }
 
 # 가상 장치 생성
-virtual_gamepad = UInput(capabilities, name='ESP32_Motion_Controller')
-print("✅ 가상 게임패드 'ESP32_Motion_Controller' 생성 완료.")
+try:
+    virtual_gamepad = UInput(capabilities, name='ESP32_BSSM_Controller')
+    print("✅ 가상 게임패드 생성 완료. ESP32 데이터를 기다립니다...")
+except Exception as err:
+    print(f"❌ 가상 장치 생성 실패: {err}")
+    print("👉 'sudo python3 gamepad_server.py'로 실행했는지 확인하세요.")
+    exit()
 
-# 조이스틱/MPU 값 매핑을 위한 상수
+# 상수 설정
 ANALOG_CENTER = 2047 
-MPU_RANGE = 90.0 
-# 버튼 매핑 리스트 (ESP32 데이터 순서와 일치: SW, B1, B2, B3, B4)
-BUTTON_MAP = [e.BTN_TL, e.BTN_A, e.BTN_B, e.BTN_X, e.BTN_Y] # 매핑 순서 변경: SW를 TL로, B1~B4를 ABXY로 매핑
+MPU_RANGE = 90.0
 
-# -----------------------------------------------------------------
-# 3. 데이터 변환 함수
-# -----------------------------------------------------------------
+def map_value(value, center, out_max):
+    # 정수로 변환하여 계산
+    return int((value - center) * (out_max / center))
 
-def map_joystick_value(raw_value):
-    """ESP32의 0~4095 값을 표준 게임패드의 -32768~32767로 매핑 (왼쪽 스틱)"""
-    return int((raw_value - ANALOG_CENTER) * (32767 / ANALOG_CENTER))
+def map_motion(angle):
+    val = int(angle / MPU_RANGE * 32767)
+    return max(-32768, min(32767, val))
 
-def map_motion_value(raw_angle):
-    """MPU의 각도 값(-90.0 ~ 90.0)을 표준 게임패드의 -32768~32767로 매핑 (오른쪽 스틱/모션)"""
-    mapped_val = int(raw_angle / MPU_RANGE * 32767)
-    return max(-32768, min(32767, mapped_val))
-
-# -----------------------------------------------------------------
-# 4. 메인 루프 (데이터 수신 및 이벤트 전송)
-# -----------------------------------------------------------------
-
+# =================================================================
+# 3. 메인 루프
+# =================================================================
 try:
     while True:
         data, addr = sock.recvfrom(1024)
         data_str = data.decode('utf-8').split(',')
         
-        # 데이터 길이 검증: 총 9개 값 (X, Y, SW, B1, B2, B3, B4, Pitch, Roll)
         if len(data_str) != 9: continue
 
         try:
+            # 데이터 파싱
             x_raw = int(data_str[0])
             y_raw = int(data_str[1])
+            btn_data = data_str[2:7]
+            pitch = float(data_str[7])
+            roll = float(data_str[8])
+
+            # --- 입력 전송 ---
             
-            # SW(2)부터 B4(6)까지 버튼 데이터 (5개)
-            button_data = data_str[2:7] 
+            # 조이스틱 (X, Y)
+            virtual_gamepad.write(e.EV_ABS, e.ABS_X, map_value(x_raw, ANALOG_CENTER, 32767))
+            virtual_gamepad.write(e.EV_ABS, e.ABS_Y, map_value(y_raw, ANALOG_CENTER, 32767))
+            
+            # 자이로 (오른쪽 스틱)
+            virtual_gamepad.write(e.EV_ABS, e.ABS_RX, map_motion(roll))
+            virtual_gamepad.write(e.EV_ABS, e.ABS_RY, map_motion(pitch))
 
-            pitch_angle = float(data_str[7]) 
-            roll_angle = float(data_str[8])
+            # 버튼
+            for i, btn_code in enumerate(BUTTON_MAP):
+                is_pressed = (btn_data[i] == '1')
+                virtual_gamepad.write(e.EV_KEY, btn_code, 1 if is_pressed else 0)
+
+            virtual_gamepad.syn() # 전송
+
         except ValueError:
-            continue # 데이터 형식 오류 시 패킷 무시
+            continue
 
-        # 4-1. 아날로그 입력 전송 (왼쪽 스틱 - 조이스틱)
-        virtual_gamepad.write(e.EV_ABS, e.ABS_X, map_joystick_value(x_raw))
-        virtual_gamepad.write(e.EV_ABS, e.ABS_Y, map_joystick_value(y_raw))
-
-        # 4-2. 모션 입력 전송 (오른쪽 스틱 - MPU)
-        virtual_gamepad.write(e.EV_ABS, e.ABS_RX, map_motion_value(roll_angle))
-        virtual_gamepad.write(e.EV_ABS, e.ABS_RY, map_motion_value(pitch_angle)) 
-
-        # 4-3. 버튼 입력 전송
-        for i in range(len(BUTTON_MAP)):
-            if i < len(button_data):
-                is_pressed = (button_data[i] == '1')
-                virtual_gamepad.write(e.EV_KEY, BUTTON_MAP[i], 1 if is_pressed else 0)
-
-        virtual_gamepad.syn() # 모든 이벤트를 한 번에 시스템에 전송
-        
 except KeyboardInterrupt:
-    print("\n👋 서버 종료 요청. 가상 게임패드를 해제합니다.")
+    print("\n종료합니다.")
 finally:
     virtual_gamepad.close()
     sock.close()
