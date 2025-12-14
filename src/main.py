@@ -1,5 +1,5 @@
 import socket
-from evdev import UInput, ecodes as e, AbsInfo
+from evdev import UInput, ecodes as e
 
 # =================================================================
 # 1. 설정
@@ -9,70 +9,32 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 try:
     sock.bind(('0.0.0.0', UDP_PORT))
-    print(f"✅ 통합 게임패드 서버 시작! 포트: {UDP_PORT}")
+    print(f"✅ 키보드 모드(방향키) 시작! 포트: {UDP_PORT}")
 except OSError as err:
     print(f"❌ 포트 에러: {err}")
     exit()
 
 # =================================================================
-# 2. 장치 설정 (버튼 + 조이스틱 + MPU)
+# 2. 가상 키보드 설정
 # =================================================================
 
-# 버튼 맵핑 (ESP32에서 오는 순서대로: SW, UP, LEFT, DOWN, RIGHT)
-# SW는 '왼쪽 스틱 클릭(THUMBL)'으로, 나머지는 '십자키(DPAD)'로 설정
-BTN_CODES = [
-    e.BTN_THUMBL,     # SW (인덱스 2)
-    e.BTN_DPAD_UP,    # UP (인덱스 3)
-    e.BTN_DPAD_LEFT,  # LEFT (인덱스 4)
-    e.BTN_DPAD_DOWN,  # DOWN (인덱스 5)
-    e.BTN_DPAD_RIGHT  # RIGHT (인덱스 6)
-]
-
-# 장치 기능 정의
-capabilities = {
-    e.EV_KEY: BTN_CODES,
-    e.EV_ABS: [
-        # 왼쪽 스틱 (조이스틱)
-        (e.ABS_X,  AbsInfo(value=0, min=-32768, max=32767, fuzz=10, flat=10, resolution=0)),
-        (e.ABS_Y,  AbsInfo(value=0, min=-32768, max=32767, fuzz=10, flat=10, resolution=0)),
-        # 오른쪽 스틱 (MPU 기울기)
-        (e.ABS_RX, AbsInfo(value=0, min=-32768, max=32767, fuzz=10, flat=10, resolution=0)),
-        (e.ABS_RY, AbsInfo(value=0, min=-32768, max=32767, fuzz=10, flat=10, resolution=0)),
-    ]
+# 사용할 키 목록 정의
+# 방향키(상하좌우) + 엔터(선택)
+CAPABILITIES = {
+    e.EV_KEY: [e.KEY_UP, e.KEY_DOWN, e.KEY_LEFT, e.KEY_RIGHT, e.KEY_ENTER]
 }
 
 try:
-    virtual_gamepad = UInput(capabilities, name='ESP32_Ultimate_Gamepad')
-    print("✅ 가상 장치 생성 완료. 연결 대기중...")
+    virtual_keyboard = UInput(CAPABILITIES, name='ESP32_Keyboard_Controller')
+    print("✅ 가상 키보드 장치 생성 완료.")
+    print("👉 조이스틱이나 버튼을 누르면 방향키가 입력됩니다.")
 except Exception as err:
     print(f"❌ 생성 실패: {err}")
     exit()
 
-# -----------------------------------------------------------------
-# 🧮 맵핑 함수 (중요!)
-# -----------------------------------------------------------------
-
-# 조이스틱 값 보정 (0~4095 -> -32768~32767)
-# ESP32: 오른쪽이 0, 왼쪽이 4095 (일반적인 것과 반대) -> 뒤집어줘야 함!
-def map_joystick(value, is_inverted=False):
-    # 중앙값 2048 기준
-    normalized = value - 2048
-    
-    # -2048 ~ 2048 범위를 -32768 ~ 32767로 확장
-    mapped = int(normalized * 16) 
-    
-    # 범위 제한 (안전장치)
-    mapped = max(-32768, min(32767, mapped))
-    
-    # 방향 뒤집기 (ESP32 하드웨어 특성 반영)
-    if is_inverted:
-        return -mapped
-    return mapped
-
-# MPU 각도 보정 (-90도~90도 -> -32768~32767)
-def map_mpu(angle):
-    val = int(angle * 364) # 32767 / 90 ≈ 364
-    return max(-32768, min(32767, val))
+# 조이스틱 임계값 (이 값보다 넘어가면 키 눌림으로 인식)
+THRESHOLD_LOW = 1000  # 0쪽에 가까울 때
+THRESHOLD_HIGH = 3000 # 4095쪽에 가까울 때
 
 # =================================================================
 # 3. 메인 루프
@@ -80,40 +42,50 @@ def map_mpu(angle):
 try:
     while True:
         data, addr = sock.recvfrom(1024)
-        # 데이터 포맷: X, Y, SW, UP, L, D, R, Pitch, Roll
+        # 데이터 포맷: X, Y, SW, UP, LEFT, DOWN, RIGHT, Pitch, Roll
         parts = data.decode('utf-8').split(',')
         
         if len(parts) != 9: continue
 
         try:
-            # 1. 데이터 파싱
-            raw_x = int(parts[0])
-            raw_y = int(parts[1])
+            # --- 1. 데이터 파싱 ---
+            x_val = int(parts[0])
+            y_val = int(parts[1])
             
-            # 버튼 데이터 (문자 '1'이면 눌린 것)
+            # 버튼 상태 (1이면 눌림)
             # parts[2]=SW, [3]=UP, [4]=L, [5]=D, [6]=R
-            btn_states = [ (p == '1') for p in parts[2:7] ] 
+            sw_pressed = (parts[2] == '1')
+            btn_up     = (parts[3] == '1')
+            btn_left   = (parts[4] == '1')
+            btn_down   = (parts[5] == '1')
+            btn_right  = (parts[6] == '1')
+
+            # --- 2. 키 입력 판정 (조이스틱 OR 버튼) ---
+            # 하나라도 참이면 해당 키를 누른 것으로 처리
             
-            pitch = float(parts[7])
-            roll = float(parts[8])
-
-            # 2. 값 변환 및 전송
+            # [오른쪽]: 조이스틱 X가 0 근처(User설정) 혹은 오른쪽 버튼
+            key_right = (x_val < THRESHOLD_LOW) or btn_right
             
-            # [조이스틱] 
-            # X축: ESP32는 오른쪽이 0이므로 뒤집어야 함 (is_inverted=True)
-            virtual_gamepad.write(e.EV_ABS, e.ABS_X, map_joystick(raw_x, is_inverted=True))
-            # Y축: 위가 0이므로 뒤집어야 함 (is_inverted=True) -> 게임패드는 위가 음수(-)
-            virtual_gamepad.write(e.EV_ABS, e.ABS_Y, map_joystick(raw_y, is_inverted=False))
+            # [왼쪽]: 조이스틱 X가 4095 근처 혹은 왼쪽 버튼
+            key_left  = (x_val > THRESHOLD_HIGH) or btn_left
+            
+            # [위]: 조이스틱 Y가 0 근처 혹은 위쪽 버튼
+            key_up    = (y_val < THRESHOLD_LOW) or btn_up
+            
+            # [아래]: 조이스틱 Y가 4095 근처 혹은 아래쪽 버튼
+            key_down  = (y_val > THRESHOLD_HIGH) or btn_down
+            
+            # [엔터]: 조이스틱 꾹 누름(SW)
+            key_enter = sw_pressed
 
-            # [MPU 기울기] -> 오른쪽 아날로그 스틱
-            virtual_gamepad.write(e.EV_ABS, e.ABS_RX, map_mpu(roll))
-            virtual_gamepad.write(e.EV_ABS, e.ABS_RY, map_mpu(pitch))
+            # --- 3. 키 전송 ---
+            virtual_keyboard.write(e.EV_KEY, e.KEY_RIGHT, 1 if key_right else 0)
+            virtual_keyboard.write(e.EV_KEY, e.KEY_LEFT,  1 if key_left else 0)
+            virtual_keyboard.write(e.EV_KEY, e.KEY_UP,    1 if key_up else 0)
+            virtual_keyboard.write(e.EV_KEY, e.KEY_DOWN,  1 if key_down else 0)
+            virtual_keyboard.write(e.EV_KEY, e.KEY_ENTER, 1 if key_enter else 0)
 
-            # [버튼]
-            for i, code in enumerate(BTN_CODES):
-                virtual_gamepad.write(e.EV_KEY, code, 1 if btn_states[i] else 0)
-
-            virtual_gamepad.syn() # 라즈베리파이에 "처리해!" 하고 전송
+            virtual_keyboard.syn() # 전송
 
         except ValueError:
             continue
@@ -121,5 +93,5 @@ try:
 except KeyboardInterrupt:
     print("\n종료합니다.")
 finally:
-    virtual_gamepad.close()
+    virtual_keyboard.close()
     sock.close()
